@@ -85,7 +85,13 @@ class GameRoom:
                 self.pid_to_info[pid]['online'] = True
             return pid
 
-        # 2. 新玩家加入，检查是否已满
+        # 2. 新玩家加入
+        
+        # 2.1 检查游戏是否已开始
+        if self.is_active:
+             raise Exception("游戏已开始，无法加入")
+
+        # 2.2 检查是否已满
         if len(self.uid_to_pid) >= self.engine.max_players:
             raise Exception("Room is full")
             
@@ -211,6 +217,7 @@ class GameRoom:
             players_data.append({
                 "socketId": info['sid'],
                 "name": info['name'],
+                "online": info.get('online', True),
                 "chips": chips,
                 "bet": bet,
                 "folded": status == 'fold',

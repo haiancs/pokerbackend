@@ -61,26 +61,39 @@ class GameRoom:
 
         # 映射: socket_id -> player_id (int)
         self.sid_to_pid: Dict[str, int] = {}
+        # 映射: persistent_id (str) -> player_id (int)
+        self.uid_to_pid: Dict[str, int] = {}
         # 映射: player_id -> player_info (name, etc.)
         self.pid_to_info: Dict[int, Dict[str, Any]] = {}
         # 游戏是否正在进行
         self.is_active = False
 
-    def add_player(self, sid: str, name: str, chips: int):
-        # 查找空座位
-        # texasholdem 库没有直接的 "add_player" API 来指定座位，它按顺序或内部逻辑分配
-        # 我们这里假设 player_id 就是座位号 0-8
-        
-        # 检查是否已满
-        if len(self.sid_to_pid) >= self.engine.max_players:
+    def add_player(self, sid: str, name: str, chips: int, uid: str = None):
+        """
+        添加或重新连接玩家
+        uid: 客户端持久化的唯一 ID
+        """
+        # 1. 检查是否是重连
+        if uid and uid in self.uid_to_pid:
+            pid = self.uid_to_pid[uid]
+            print(f"Player {name} reconnecting with uid {uid} to pid {pid}")
+            # 更新 sid 映射
+            self.sid_to_pid[sid] = pid
+            if pid in self.pid_to_info:
+                self.pid_to_info[pid]['sid'] = sid
+                self.pid_to_info[pid]['name'] = name # 可能更改了名字
+                self.pid_to_info[pid]['online'] = True
+            return pid
+
+        # 2. 新玩家加入，检查是否已满
+        if len(self.uid_to_pid) >= self.engine.max_players:
             raise Exception("Room is full")
             
         # 分配一个 ID (0 to max_players-1)
-        # 简单策略：找一个没被占用的最小 ID
-        used_ids = set(self.sid_to_pid.values())
+        used_pids = set(self.uid_to_pid.values())
         new_pid = -1
         for i in range(self.engine.max_players):
-            if i not in used_ids:
+            if i not in used_pids:
                 new_pid = i
                 break
         
@@ -88,11 +101,16 @@ class GameRoom:
             raise Exception("No seats available")
             
         self.sid_to_pid[sid] = new_pid
+        if uid:
+            self.uid_to_pid[uid] = new_pid
+            
         self.pid_to_info[new_pid] = {
             "name": name,
             "chips": chips,
             "sid": sid,
-            "is_ready": False
+            "uid": uid,
+            "is_ready": False,
+            "online": True
         }
         
         # 关键修复：确保 player 存在且有筹码
@@ -117,11 +135,22 @@ class GameRoom:
     def remove_player(self, sid: str):
         if sid in self.sid_to_pid:
             pid = self.sid_to_pid[sid]
-            del self.sid_to_pid[sid]
+            # 标记为离线，但不立即删除，除非游戏未开始
             if pid in self.pid_to_info:
-                del self.pid_to_info[pid]
-            # 注意：如果游戏正在进行中，玩家离开需要特殊处理（如 Fold）
-            # 引擎库通常需要 active players 列表
+                self.pid_to_info[pid]['online'] = False
+                
+            # 如果游戏没在进行，可以直接移除
+            if not self.is_active:
+                del self.sid_to_pid[sid]
+                if pid in self.pid_to_info:
+                    uid = self.pid_to_info[pid].get('uid')
+                    if uid and uid in self.uid_to_pid:
+                        del self.uid_to_pid[uid]
+                    del self.pid_to_info[pid]
+                return pid
+            
+            # 游戏进行中，只移除 sid 映射，保留 uid 映射供重连
+            del self.sid_to_pid[sid]
             return pid
         return None
 
@@ -284,8 +313,24 @@ async def disconnect(sid):
     # 查找并移除玩家
     for room_id, room in rooms.items():
         if sid in room.sid_to_pid:
-            pid = room.remove_player(sid)
-            await sio.emit('player_left', {'playerId': sid}, room=room_id)
+            # 获取 pid 和 uid
+            pid = room.sid_to_pid[sid]
+            uid = room.pid_to_info[pid].get('uid')
+            
+            # 移除玩家 (如果游戏未进行则彻底移除，否则标记离线)
+            removed_pid = room.remove_player(sid)
+            
+            if removed_pid is not None:
+                # 只有当玩家被真正移除时（游戏未进行），才广播 player_left
+                # 如果游戏进行中，remove_player 返回 pid，但 pid_to_info 还在
+                
+                # 检查是否真的移除了（通过 pid_to_info）
+                if removed_pid not in room.pid_to_info:
+                    await sio.emit('player_left', {'playerId': sid, 'uid': uid}, room=room_id)
+                else:
+                    print(f"Player {sid} (pid={removed_pid}) disconnected but kept in game (active)")
+                    # 可以选择广播一个 'player_disconnected' 事件
+            
             # 广播更新
             await broadcast_game_state(room_id)
             break
@@ -293,10 +338,16 @@ async def disconnect(sid):
 @sio.event
 async def join_table(sid, data):
     """
-    data: { tableId, playerName, maxHands, maxPlayers }
+    data: { tableId, playerName, maxHands, maxPlayers, uid }
     """
     room_id = data.get('tableId', 'default')
     player_name = data.get('playerName', 'Guest')
+    uid = data.get('uid') # 前端生成的唯一 ID
+    
+    if not uid:
+        # 如果没有 uid，使用 sid 作为临时 uid，或者报错
+        # 为了兼容性，如果没有 uid，暂且用 sid
+        uid = sid
     
     if room_id not in rooms:
         print(f"Creating new room: {room_id}")
@@ -311,14 +362,18 @@ async def join_table(sid, data):
 
         # 添加玩家
         # 初始筹码 1000
-        pid = room.add_player(sid, player_name, 1000)
+        # 注意：add_player 内部会处理重连逻辑（如果 uid 已存在）
+        # 如果是重连，chips 参数会被忽略
+        pid = room.add_player(sid, player_name, 1000, uid=uid)
         
         await sio.enter_room(sid, room_id)
         
-        print(f"Player {player_name} (pid={pid}) joined room {room_id}")
+        print(f"Player {player_name} (pid={pid}, uid={uid}) joined room {room_id}")
 
         # 通知房间
-        await sio.emit('player_joined', {'player': {'name': player_name, 'chips': 1000}}, room=room_id)
+        # 如果是重连，可能不需要发 player_joined，或者发一个 reconnected
+        # 这里统一发 joined，前端可以根据 uid 去重或更新
+        await sio.emit('player_joined', {'player': {'name': player_name, 'chips': 1000, 'uid': uid}}, room=room_id)
         
         # 广播最新状态
         await broadcast_game_state(room_id)

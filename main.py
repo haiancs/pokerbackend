@@ -7,7 +7,7 @@ from typing import Dict, Optional, Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from texasholdem import TexasHoldEm, HandPhase, ActionType, Card
+from texasholdem import TexasHoldEm, HandPhase, ActionType, Card, evaluator
 
 # -----------------------------------------------------------------------------
 # 1. 基础配置与 SocketIO 初始化
@@ -44,7 +44,7 @@ app_asgi = socketio.ASGIApp(sio, app)
 # -----------------------------------------------------------------------------
 
 class GameRoom:
-    def __init__(self, room_id: str, max_players: int = 9):
+    def __init__(self, room_id: str, max_players: int = 9, max_hands: Optional[int] = None):
         self.room_id = room_id
         # 初始化核心引擎
         from texasholdem import PlayerState
@@ -67,6 +67,9 @@ class GameRoom:
         self.pid_to_info: Dict[int, Dict[str, Any]] = {}
         # 游戏是否正在进行
         self.is_active = False
+        self.max_hands = max_hands if max_hands and max_hands > 0 else max_players * 2
+        self.hands_played = 0
+        self.game_over = False
 
     def add_player(self, sid: str, name: str, chips: int, uid: str = None):
         """
@@ -230,7 +233,7 @@ class GameRoom:
 
         # 安全获取 currentBet
         current_bet = 0
-        if self.engine.current_player is not None:
+        if self.engine.is_hand_running() and self.engine.current_player is not None and self.engine.current_player >= 0:
              try:
                  # chips_to_call is how much MORE they need to put in
                  to_call = self.engine.chips_to_call(self.engine.current_player)
@@ -250,6 +253,19 @@ class GameRoom:
 
         # 获取赢家信息
         winners = []
+        showdown = False
+        alive_players = 0
+        for i in range(self.engine.max_players):
+            info = self.pid_to_info.get(i)
+            if not info:
+                continue
+            if i < len(self.engine.players):
+                state_name = self.engine.players[i].state.name
+                if state_name not in ('FOLDED', 'OUT', 'SKIP'):
+                    alive_players += 1
+        if alive_players >= 2 and not self.engine.is_hand_running():
+            showdown = True
+
         from texasholdem import HandPhase
         # 检查是否在 SETTLE 阶段或手牌结束
         # texasholdem 0.11.0: hand_history[HandPhase.SETTLE]
@@ -267,20 +283,32 @@ class GameRoom:
                                 "id": pid,
                                 "name": self.pid_to_info[pid]['name'],
                                 "amount": amount, # 注意：这是整个底池，如果多人分需要除以 len(pids)
-                                "handRank": rank # 牌型等级 (数字越小越大)
+                                "handRank": rank,
+                                "handRankText": safe_rank_to_string(rank)
                             })
 
+        min_raise = self.engine.big_blind
+        try:
+            min_raise = self.engine.min_raise()
+        except:
+            pass
+
+        state = "GAME_OVER" if self.game_over else (phase_to_str(self.engine.hand_phase) if self.engine.is_hand_running() else "WAITING")
+
         return {
-            "state": phase_to_str(self.engine.hand_phase) if self.engine.is_hand_running() else "WAITING",
+            "state": state,
             "pot": pot,
             "communityCards": community_cards,
             "currentBet": current_bet,
             "dealerIndex": self.engine.btn_loc,
             "players": players_data,
-            "minRaise": self.engine.big_blind,
+            "minRaise": min_raise,
+            "minTotalRaiseTo": current_bet + min_raise,
             "bigBlind": self.engine.big_blind,
-            "handsPlayed": 0,
-            "winners": winners # 新增字段
+            "handsPlayed": self.hands_played,
+            "maxHands": self.max_hands,
+            "winners": winners,
+            "showdown": showdown
         }
 
 # 全局房间字典
@@ -305,6 +333,30 @@ def phase_to_str(phase) -> str:
     if phase == HandPhase.RIVER: return "RIVER"
     if phase == HandPhase.SETTLE: return "SHOWDOWN" # 库可能是 SETTLE
     return "WAITING"
+
+def safe_rank_to_string(rank: Any) -> str:
+    try:
+        rank_int = int(rank)
+    except:
+        return "未知牌型"
+    if rank_int < 1 or rank_int > 7462:
+        return "未知牌型"
+    try:
+        rank_name = evaluator.rank_to_string(rank_int)
+    except:
+        return "未知牌型"
+    rank_map = {
+        "Straight Flush": "同花顺",
+        "Four of a Kind": "四条",
+        "Full House": "葫芦",
+        "Flush": "同花",
+        "Straight": "顺子",
+        "Three of a Kind": "三条",
+        "Two Pair": "两对",
+        "Pair": "一对",
+        "High card": "高牌"
+    }
+    return rank_map.get(rank_name, rank_name)
 
 # -----------------------------------------------------------------------------
 # 4. Socket.IO 事件处理
@@ -356,9 +408,21 @@ async def join_table(sid, data):
         # 为了兼容性，如果没有 uid，暂且用 sid
         uid = sid
     
+    max_players = data.get('maxPlayers', 9)
+    max_hands = data.get('maxHands')
+    try:
+        max_players = int(max_players) if max_players else 9
+    except:
+        max_players = 9
+    max_players = max(2, min(9, max_players))
+    try:
+        max_hands = int(max_hands) if max_hands else None
+    except:
+        max_hands = None
+
     if room_id not in rooms:
         print(f"Creating new room: {room_id}")
-        rooms[room_id] = GameRoom(room_id)
+        rooms[room_id] = GameRoom(room_id, max_players=max_players, max_hands=max_hands)
     
     room = rooms[room_id]
     
@@ -398,6 +462,10 @@ async def player_ready(sid, data):
     room = rooms[room_id]
     
     if sid in room.sid_to_pid:
+        if room.game_over:
+            await broadcast_game_state(room_id)
+            return
+
         pid = room.sid_to_pid[sid]
         info = room.pid_to_info[pid]
         info['is_ready'] = not info['is_ready'] # Toggle
@@ -420,6 +488,12 @@ async def player_ready(sid, data):
         
         print(f"Room {room_id}: {ready_count}/{total_valid} valid players ready. Active: {room.is_active}")
         
+        if total_valid < 2:
+            room.game_over = True
+            room.is_active = False
+            await broadcast_game_state(room_id)
+            return
+
         if not room.is_active and total_valid >= 2 and ready_count == total_valid:
             # Force player state to TO_CALL to ensure they are picked up by start_hand
             from texasholdem import PlayerState
@@ -480,6 +554,8 @@ async def action(sid, data):
             act_type = ActionType.RAISE
             total = amount # 需要确认库是接收增量还是总量
             # 库文档：take_action(ActionType.RAISE, total=10) -> raise TO 10
+        elif action_str == 'allin':
+            act_type = ActionType.ALL_IN
             
         # 执行动作
         if act_type:
@@ -495,6 +571,7 @@ async def action(sid, data):
             if not room.engine.is_hand_running():
                 # 游戏结束，处理结算
                 print(f"Hand ended in room {room_id}")
+                room.hands_played += 1
                 
                 # 1. 广播最终状态（含亮牌）
                 await broadcast_game_state(room_id)
@@ -508,6 +585,17 @@ async def action(sid, data):
                 # 重置所有玩家的 Ready 状态
                 for pid, info in room.pid_to_info.items():
                     info['is_ready'] = False
+
+                # 检查是否满足游戏结束条件
+                active_with_chips = 0
+                for pid_, info_ in room.pid_to_info.items():
+                    if pid_ < len(room.engine.players) and room.engine.players[pid_].chips > 0:
+                        active_with_chips += 1
+
+                if active_with_chips <= 1:
+                    room.game_over = True
+                if room.max_hands and room.hands_played >= room.max_hands:
+                    room.game_over = True
                     
                 # 广播更新（通知前端显示结算 Modal 和准备按钮）
                 await broadcast_game_state(room_id)
@@ -524,6 +612,9 @@ async def action(sid, data):
 
 async def start_game(room: GameRoom):
     print(f"Starting game in room {room.room_id}")
+    if room.game_over:
+        await broadcast_game_state(room.room_id)
+        return
     room.is_active = True
     room.engine.start_hand()
     await broadcast_game_state(room.room_id)
@@ -538,6 +629,8 @@ async def broadcast_game_state(room_id: str):
     # 避免在迭代时修改字典
     targets = list(room.pid_to_info.items())
     
+    reveal_showdown_cards = public_state.get('showdown', False)
+
     for pid, info in targets:
         sid = info['sid']
         
@@ -546,15 +639,21 @@ async def broadcast_game_state(room_id: str):
         # 深度复制 players 列表
         private_players = [p.copy() for p in public_state['players']]
         
-        # 填充自己的手牌
-        my_hand_ints = room.engine.get_hand(pid)
-        if my_hand_ints:
-            my_hand_str = [card_to_str(c) for c in my_hand_ints]
-            # 找到自己在 private_players 中的条目
+        if reveal_showdown_cards:
             for p in private_players:
-                if p['id'] == pid:
-                    p['hand'] = my_hand_str
-                    break
+                if p.get('folded'):
+                    continue
+                hand_ints = room.engine.get_hand(p['id'])
+                if hand_ints:
+                    p['hand'] = [card_to_str(c) for c in hand_ints]
+        else:
+            my_hand_ints = room.engine.get_hand(pid)
+            if my_hand_ints:
+                my_hand_str = [card_to_str(c) for c in my_hand_ints]
+                for p in private_players:
+                    if p['id'] == pid:
+                        p['hand'] = my_hand_str
+                        break
         
         private_state['players'] = private_players
         

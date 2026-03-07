@@ -149,12 +149,28 @@ class GameRoom:
                 self.pid_to_info[pid]['online'] = False
                 
             # 如果游戏没在进行，可以直接移除
+            # 只有当房间内没有人在线时，才考虑彻底清理房间（可选）
+            # 但这里我们只移除玩家
             if not self.is_active:
                 del self.sid_to_pid[sid]
+                # 只有当确实要踢出玩家时才清理 uid 映射
+                # 现在的逻辑是：disconnect 只是断线，只有显式 'leave_room' 才踢人
+                # 但目前没有 leave_room，所以 disconnect 暂时视为“暂离”
+                # 如果要永久移除，应该判断游戏状态
+                
+                # 修改：Disconnect 暂不完全移除，保留座位一段时间
+                # 但为了简单，如果游戏没开始，Disconnect 直接移除
                 if pid in self.pid_to_info:
                     uid = self.pid_to_info[pid].get('uid')
                     if uid and uid in self.uid_to_pid:
                         del self.uid_to_pid[uid]
+                    
+                    # 关键：还要将引擎中的该位置重置为 SKIP，否则 start_hand 会算上他
+                    if pid < len(self.engine.players):
+                        from texasholdem import PlayerState
+                        self.engine.players[pid].state = PlayerState.SKIP
+                        self.engine.players[pid].chips = 0
+                        
                     del self.pid_to_info[pid]
                 return pid
             
@@ -246,10 +262,15 @@ class GameRoom:
                  traceback.print_exc()
                  current_bet = 0
 
-        # 安全获取 pot
-        pot = 0
+        # 安全获取 pot (包含所有分池)
+        pots = []
+        total_pot = 0
         if self.engine.pots:
-            pot = sum(p.get_total_amount() for p in self.engine.pots)
+            for p in self.engine.pots:
+                amt = p.get_total_amount()
+                if amt > 0:
+                    pots.append(amt)
+                    total_pot += amt
 
         # 获取赢家信息
         winners = []
@@ -297,7 +318,8 @@ class GameRoom:
 
         return {
             "state": state,
-            "pot": pot,
+            "pot": total_pot,
+            "pots": pots,
             "communityCards": community_cards,
             "currentBet": current_bet,
             "dealerIndex": self.engine.btn_loc,
@@ -512,6 +534,55 @@ async def player_ready(sid, data):
             await broadcast_game_state(room_id)
 
 @sio.event
+async def restart_game(sid, data):
+    room_id = data.get('tableId')
+    if room_id not in rooms: return
+    room = rooms[room_id]
+    
+    # 检查是否允许重置（例如必须是 game_over 状态）
+    if not room.game_over:
+        return
+
+    print(f"Restarting game in room {room.room_id}")
+    
+    # 重置房间状态
+    room.game_over = False
+    room.hands_played = 0
+    room.is_active = False
+    
+    # 重建引擎以清除旧状态
+    # 保留 max_players 等配置
+    old_max_players = room.engine.max_players
+    room.engine = TexasHoldEm(
+        buyin=1000, 
+        big_blind=20, 
+        small_blind=10, 
+        max_players=old_max_players
+    )
+    
+    # 恢复玩家
+    # 注意：这里我们将所有玩家筹码重置为 1000
+    from texasholdem import PlayerState
+    for pid, info in room.pid_to_info.items():
+        # 重置 info
+        info['is_ready'] = False
+        info['chips'] = 1000
+        
+        # 将玩家加回引擎
+        if pid < len(room.engine.players):
+            room.engine.players[pid].chips = 1000
+            room.engine.players[pid].state = PlayerState.TO_CALL
+            
+    # 确保其他空位是 SKIP
+    for i in range(room.engine.max_players):
+        if i not in room.pid_to_info:
+             if i < len(room.engine.players):
+                 room.engine.players[i].state = PlayerState.SKIP
+                 room.engine.players[i].chips = 0
+
+    await broadcast_game_state(room_id)
+
+@sio.event
 async def action(sid, data):
     """
     data: { tableId, action: 'call'|'fold'|'raise'|'check', amount: int }
@@ -604,6 +675,8 @@ async def action(sid, data):
                 
     except Exception as e:
         print(f"Action error: {e}")
+        import traceback
+        traceback.print_exc()
         await sio.emit('error', {'message': str(e)}, to=sid)
 
 # -----------------------------------------------------------------------------
